@@ -43,6 +43,10 @@ global SnapMargin := 30
 ;; (so a plain Win+click on a maximized window doesn't un-maximize it)
 global DragThreshold := 6
 
+;; true  = bring the window to the front and give it focus when you start dragging it
+;; false = leave focus and the window order alone while dragging
+global FocusOnDrag := true
+
 ;; how often (ms) the drag is updated
 global delay := 10
 
@@ -58,6 +62,8 @@ global Busy := false
 global DragActive := false
 global DragType := ""
 global DragMoved := false
+;; have we already focused the window for this drag?
+global DragFocused := false
 
 ;; the window we "grabbed" - so we don't accidentally grab another one during move/resize
 global GrabbedWindow := ""
@@ -180,6 +186,7 @@ ResetGrab() {
     global GrabMaxW := 0
     global GrabMinH := 0
     global GrabMaxH := 0
+    global DragFocused := false
 }
 
 MoveWindow() {
@@ -202,6 +209,7 @@ DoStuffToWindows(what) {
     global GrabbedWindow, GrabbedHalfX, GrabbedHalfY
     global SnapWindow, SnapMonitor
     global GrabMinW, GrabMaxW, GrabMinH, GrabMaxH
+    global FocusOnDrag, DragFocused
     global MinWidth, MinHeight, KeepVisible, DragThreshold
 
     ;; a stray timer from a drag that's already over
@@ -249,6 +257,12 @@ DoStuffToWindows(what) {
                 ;; move cursor - for a maximized window only once it's really being dragged
                 if (what == "move" && (DragMoved || not (Style & WS_MAXIMIZE)))
                     SetDragCursor("move")
+
+                ;; bring the window to the front, once, at the start of the drag
+                if (FocusOnDrag && not DragFocused) {
+                    DragFocused := true
+                    FocusWindow(Window)
+                }
 
                 if (Style & WS_MAXIMIZE) {
                     ;; a maximized window: once the mouse really moves, restore it and put it under
@@ -509,6 +523,12 @@ RestoreCursor(force := false) {
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; HELPERS
 
+FocusWindow(window) {
+    try {
+        WinActivate(window)
+    }
+}
+
 SetWindowAnimations(window, enable) {
     try {
         ;; DWMWA_TRANSITIONS_FORCEDISABLED = 3
@@ -577,9 +597,11 @@ MoveAndResize(WindowX, WindowY, WindowWidth := "", WindowHeight := "", Window :=
     ;; Plain SetWindowPos flags on purpose. Skipping the redraw / copy-bits steps and then repainting
     ;; by hand is what made windows flicker - Windows repaints them far better by itself.
     ;; SWP_NOSENDCHANGING is also left out, so windows get to apply their own min/max sizes.
+    ;; SWP_NOACTIVATE: moving/resizing never changes focus by itself - that's the FocusOnDrag setting.
     SWP_NOSIZE := 0x0001
     SWP_NOZORDER := 0x0004
-    Flags := SWP_NOZORDER
+    SWP_NOACTIVATE := 0x0010
+    Flags := SWP_NOZORDER | SWP_NOACTIVATE
     try {
         if (WindowWidth && WindowHeight) {
             DllCall("SetWindowPos", "Ptr", Window, "Ptr", 0, "Int", Round(WindowX), "Int", Round(WindowY), "Int", Round(WindowWidth), "Int", Round(WindowHeight), "UInt", Flags)
