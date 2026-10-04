@@ -2,10 +2,10 @@
 #SingleInstance Force
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; Based on DPaZ by sebmaynard
-;; Modified by HardBucks (with Claude): Win-only hotkeys, removed pan/zoom, snap-to-maximize, multi-monitor fixes, etc.
 ;; Move and resize windows by holding the Windows key and
 ;; dragging with the mouse.
+;; Based on DPaZ by sebmaynard
+;; Modified by HardBucks (with Claude)
 ;;
 ;;    Win + Left mouse:  Move the window under the cursor
 ;;    Win + Right mouse: Resize the window under the cursor
@@ -13,6 +13,8 @@
 ;; - Drag a window to the top edge of a monitor and let go to maximize it
 ;;   (a blue preview shows what will happen)
 ;; - Grabbing a maximized window restores it first
+;; - The mouse cursor changes while you drag (move arrows, or a diagonal
+;;   resize arrow that matches the corner you grabbed)
 ;; - Windows can't be shrunk below a minimum size, or grown beyond the screen
 ;; - Windows can't be dragged completely off-screen
 ;; - Fixed-size windows, fullscreen apps, the desktop and the taskbar are left alone
@@ -62,6 +64,11 @@ global GrabbedWindow := ""
 ;; which half of the window we grabbed when resizing - "left"/"right"/"" and "top"/"bottom"/""
 global GrabbedHalfX := ""
 global GrabbedHalfY := ""
+;; size limits the app has shown us during a resize (0 = none found yet)
+global GrabMinW := 0
+global GrabMaxW := 0
+global GrabMinH := 0
+global GrabMaxH := 0
 
 ;; the window (and monitor number) that will be maximized if the mouse is released now
 global SnapWindow := ""
@@ -72,6 +79,18 @@ global PreviewGui := Gui("+AlwaysOnTop -Caption +ToolWindow -DPIScale +E0x80000 
 PreviewGui.BackColor := "3B82F6"
 DllCall("SetLayeredWindowAttributes", "Ptr", PreviewGui.Hwnd, "UInt", 0, "UChar", 90, "UInt", 2)
 global PreviewRect := ""
+
+;; which cursor we're showing right now: "" (the normal ones), "move", "nwse" or "nesw"
+global CursorState := ""
+
+;; if an earlier run died in the middle of a drag it may have left a changed cursor behind
+RestoreCursor(true)
+;; make sure the cursor goes back to normal when the script quits or reloads
+OnExit(ExitCleanup)
+
+ExitCleanup(reason, code) {
+    RestoreCursor()
+}
 
 ;; cancel any drag if the PC gets locked (we'd never see the mouse button being released)
 try {
@@ -141,6 +160,7 @@ EndDrag(what, cancel := false) {
     SetTimer MoveWindow, 0
     SetTimer ResizeWindow, 0
     HideSnapPreview()
+    RestoreCursor()
 
     TargetWindow := SnapWindow
     TargetMonitor := SnapMonitor
@@ -156,6 +176,10 @@ ResetGrab() {
     global GrabbedWindow := ""
     global GrabbedHalfX := ""
     global GrabbedHalfY := ""
+    global GrabMinW := 0
+    global GrabMaxW := 0
+    global GrabMinH := 0
+    global GrabMaxH := 0
 }
 
 MoveWindow() {
@@ -177,6 +201,7 @@ DoStuffToWindows(what) {
     global DragActive, DragType, DragMoved
     global GrabbedWindow, GrabbedHalfX, GrabbedHalfY
     global SnapWindow, SnapMonitor
+    global GrabMinW, GrabMaxW, GrabMinH, GrabMaxH
     global MinWidth, MinHeight, KeepVisible, DragThreshold
 
     ;; a stray timer from a drag that's already over
@@ -221,15 +246,27 @@ DoStuffToWindows(what) {
             if (IsGoodWindow(Window, X, Y, W, H)) {
                 Style := WinGetStyle(Window)
 
+                ;; move cursor - for a maximized window only once it's really being dragged
+                if (what == "move" && (DragMoved || not (Style & WS_MAXIMIZE)))
+                    SetDragCursor("move")
+
                 if (Style & WS_MAXIMIZE) {
                     ;; a maximized window: once the mouse really moves, restore it and put it under
                     ;; the cursor so the cursor stays at the same relative spot on the window
                     if (DragMoved) {
                         FracX := Min(Max((MouseX - X) / W, 0), 1)
                         FracY := Min(Max((MouseY - Y) / H, 0), 1)
-                        WinRestore(Window)
-                        WinGetPos(&X, &Y, &W, &H, Window)
-                        MoveAndResize(Round(MouseX - FracX * W), Round(MouseY - FracY * H), , , Window)
+                        ;; Windows animates the un-maximize, which looks like a flash when we
+                        ;; immediately move the window - so switch the animation off just for this
+                        SetWindowAnimations(Window, false)
+                        try {
+                            WinRestore(Window)
+                            WinGetPos(&X, &Y, &W, &H, Window)
+                            MoveAndResize(Round(MouseX - FracX * W), Round(MouseY - FracY * H), , , Window)
+                        }
+                        finally {
+                            SetWindowAnimations(Window, true)
+                        }
                     }
                 }
                 else {
@@ -278,6 +315,10 @@ DoStuffToWindows(what) {
                             GrabbedHalfY := (MouseY < Y + H / 2) ? "top" : "bottom"
                         }
 
+                        ;; top-left / bottom-right corners get the \ arrow, the other two get the / arrow
+                        SameDiagonal := ((GrabbedHalfX == "left") == (GrabbedHalfY == "top"))
+                        SetDragCursor(SameDiagonal ? "nwse" : "nesw")
+
                         ;; how much the mouse moved, in the direction that grows the window
                         DeltaX := MouseX - StartX
                         DeltaY := MouseY - StartY
@@ -291,6 +332,16 @@ DoStuffToWindows(what) {
                         NewW := Min(Max(W + DeltaX, Min(MinWidth, W)), Max(VW, W))
                         NewH := Min(Max(H + DeltaY, Min(MinHeight, H)), Max(VH, H))
 
+                        ;; limits this app already showed us earlier in the drag
+                        if (GrabMinW)
+                            NewW := Max(NewW, GrabMinW)
+                        if (GrabMaxW)
+                            NewW := Min(NewW, GrabMaxW)
+                        if (GrabMinH)
+                            NewH := Max(NewH, GrabMinH)
+                        if (GrabMaxH)
+                            NewH := Min(NewH, GrabMaxH)
+
                         ;; keep the opposite corner fixed
                         NewX := (GrabbedHalfX == "left") ? X + W - NewW : X
                         NewY := (GrabbedHalfY == "top") ? Y + H - NewH : Y
@@ -298,6 +349,18 @@ DoStuffToWindows(what) {
 
                         ;; the app may have refused the size we asked for (its own min/max size) - see what we got
                         WinGetPos(, , &ActualW, &ActualH, Window)
+
+                        ;; if it refused, remember where its limit is so the next ticks ask for that
+                        ;; straight away instead of asking for too much and correcting every time
+                        if (ActualW > NewW)
+                            GrabMinW := ActualW
+                        else if (ActualW < NewW)
+                            GrabMaxW := ActualW
+                        if (ActualH > NewH)
+                            GrabMinH := ActualH
+                        else if (ActualH < NewH)
+                            GrabMaxH := ActualH
+
                         if (ActualW != NewW || ActualH != NewH) {
                             NewX := (GrabbedHalfX == "left") ? X + W - ActualW : X
                             NewY := (GrabbedHalfY == "top") ? Y + H - ActualH : Y
@@ -315,8 +378,6 @@ DoStuffToWindows(what) {
                         NextStartY := StartY + AppliedY
                     }
                 }
-
-                SetTimer(ResumeRedraw.Bind(Window), -delay)
             }
         }
     }
@@ -408,16 +469,52 @@ SnapMaximize(window, MonitorNumber) {
 }
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; CURSOR
+
+;; Swaps every system cursor (arrow, text beam, hand, etc.) for the one we want, so it shows
+;; no matter what is under the mouse. RestoreCursor puts the user's real cursors back.
+SetDragCursor(kind) {
+    global CursorState
+    if (kind == CursorState)
+        return
+
+    ;; IDC_SIZEALL, IDC_SIZENWSE, IDC_SIZENESW
+    IdcId := (kind == "move") ? 32646 : ((kind == "nwse") ? 32642 : 32643)
+
+    ;; make our own copy first - Windows destroys whatever cursor we hand it, and the
+    ;; one LoadCursor gives back is shared with the system
+    Master := DllCall("CopyImage", "Ptr", DllCall("LoadCursor", "Ptr", 0, "Ptr", IdcId, "Ptr"), "UInt", 2, "Int", 0, "Int", 0, "UInt", 0, "Ptr")
+    if (not Master)
+        return
+
+    for SlotId in [32512, 32513, 32514, 32515, 32516, 32642, 32643, 32644, 32645, 32646, 32648, 32649, 32650, 32651] {
+        CursorCopy := DllCall("CopyImage", "Ptr", Master, "UInt", 2, "Int", 0, "Int", 0, "UInt", 0, "Ptr")
+        if (CursorCopy)
+            DllCall("SetSystemCursor", "Ptr", CursorCopy, "UInt", SlotId)
+    }
+    DllCall("DestroyCursor", "Ptr", Master)
+
+    CursorState := kind
+}
+
+RestoreCursor(force := false) {
+    global CursorState
+    if (CursorState == "" && not force)
+        return
+    CursorState := ""
+    ;; SPI_SETCURSORS - reload the user's cursors from their Windows settings
+    DllCall("SystemParametersInfo", "UInt", 0x57, "UInt", 0, "Ptr", 0, "UInt", 0)
+}
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; HELPERS
 
-ResumeRedraw(window) {
+SetWindowAnimations(window, enable) {
     try {
-        SendMessage(0xB, 1, 0, , window) ; wParam 1 enables redraw
-        ; force a redraw
-        DllCall("RedrawWindow", "Ptr", WinExist(window), "Ptr", 0, "Ptr", 0, "UInt", 0x85)
-    }
-    catch {
-        ;; window closed in the meantime
+        ;; DWMWA_TRANSITIONS_FORCEDISABLED = 3
+        Disabled := Buffer(4, 0)
+        NumPut("Int", enable ? 0 : 1, Disabled)
+        DllCall("dwmapi\DwmSetWindowAttribute", "Ptr", window, "UInt", 3, "Ptr", Disabled, "UInt", 4)
     }
 }
 
@@ -425,6 +522,10 @@ IsGoodWindow(window, X, Y, W, H) {
     try {
         ;; Skip tiny windows
         if (W < 2 || H < 2)
+            return false
+
+        ;; Skip windows that aren't responding - moving one would hang this script as well
+        if (DllCall("IsHungAppWindow", "Ptr", window))
             return false
 
         ;; Skip the desktop, taskbar, and other parts of the Windows shell
@@ -473,19 +574,17 @@ IsGoodWindow(window, X, Y, W, H) {
 }
 
 MoveAndResize(WindowX, WindowY, WindowWidth := "", WindowHeight := "", Window := "") {
-    ;; Note: SWP_NOSENDCHANGING is deliberately NOT used, so that windows get to apply
-    ;; their own minimum/maximum size limits instead of being forced to any size.
-    SWP_NOREDRAW := 0x0008
-    SWP_DEFERERASE := 0x2000
-    SWP_NOCOPYBITS := 0x0100
+    ;; Plain SetWindowPos flags on purpose. Skipping the redraw / copy-bits steps and then repainting
+    ;; by hand is what made windows flicker - Windows repaints them far better by itself.
+    ;; SWP_NOSENDCHANGING is also left out, so windows get to apply their own min/max sizes.
+    SWP_NOSIZE := 0x0001
     SWP_NOZORDER := 0x0004
-    Flags := SWP_NOREDRAW | SWP_DEFERERASE | SWP_NOCOPYBITS | SWP_NOZORDER
+    Flags := SWP_NOZORDER
     try {
         if (WindowWidth && WindowHeight) {
             DllCall("SetWindowPos", "Ptr", Window, "Ptr", 0, "Int", Round(WindowX), "Int", Round(WindowY), "Int", Round(WindowWidth), "Int", Round(WindowHeight), "UInt", Flags)
         }
         else {
-            SWP_NOSIZE := 0x0001
             Flags |= SWP_NOSIZE
             DllCall("SetWindowPos", "Ptr", Window, "Ptr", 0, "Int", Round(WindowX), "Int", Round(WindowY), "Int", 0, "Int", 0, "UInt", Flags)
         }
