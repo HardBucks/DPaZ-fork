@@ -4,9 +4,11 @@ I really like how linux lets you drag windows around with a hotkey. I tried AltD
 
 So I took sebmaynard's [DPaZ](https://github.com/sebmaynard/DPaZ) script and messed with it using Claude (vibecoding maxxing) and try to make a better version for myself.
 
+Also this script is very basic there is probably better alternatives out there, I'm just doing this for personal use
+
 ## Demo
 
-https://github.com/user-attachments/assets/66814d7d-0dae-43a7-8081-f0dd0eb6b9fb
+https://github.com/user-attachments/assets/96829a9c-c76e-44e4-998c-08fb9ca14285
 
 ## Mappings
 
@@ -26,6 +28,8 @@ https://github.com/user-attachments/assets/66814d7d-0dae-43a7-8081-f0dd0eb6b9fb
 - it excluded apps like games with fullscreen and other apps that is fullscreen
 - holding left and right click at the same time used to fight over the same window. now fixed
 - if you lock your pc in the middle of a drag it cancels the drag
+- cursor changed when you dragging
+- window focuses when you dragging
 
 ## Installation
 
@@ -42,6 +46,7 @@ If you want it to start when you log in:
 - `KeepVisible`: how much of a window has to stay on screen
 - `SnapMargin`: how close to the top of the screen you need to be to maximize
 - `DragThreshold`: how far you have to drag before a click counts as a drag
+- `FocusOnDrag`: focuses window when you're dragging
 
 ## Stuff that doesn't work
 
