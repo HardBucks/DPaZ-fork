@@ -2,6 +2,8 @@
 #SingleInstance Force
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Based on DPaZ by sebmaynard
+;; Modified by HardBucks (with Claude): Win-only hotkeys, removed pan/zoom, snap-to-maximize, multi-monitor fixes, etc.
 ;; Move and resize windows by holding the Windows key and
 ;; dragging with the mouse.
 ;;
