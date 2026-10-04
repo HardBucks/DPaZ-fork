@@ -6,7 +6,7 @@ So I took sebmaynard's [DPaZ](https://github.com/sebmaynard/DPaZ) script and mes
 
 ## Demo
 
-https://github.com/user-attachments/assets/dbd5d3b4-4be3-4022-b728-4749ae275701
+https://github.com/user-attachments/assets/66814d7d-0dae-43a7-8081-f0dd0eb6b9fb
 
 ## Mappings
 
