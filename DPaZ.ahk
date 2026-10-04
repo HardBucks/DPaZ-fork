@@ -1,309 +1,494 @@
 #Requires AutoHotkey v2.0
+#SingleInstance Force
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; A script which lets you move stuff around the screen, resize it, 
-;; and pan and zoom around your whole desktop, just like you would in
-;; something like Miro
-;; 
-;; Press ctrl+windows then mouse buttons:
-;;    Left mouse: Move the window under the cursor
-;;    Right mouse: Resize the window under the cursor
-;;    Middle mouse: Pan the whole desktop around
-;;    Scroll wheel: "Zoom" the desktop - feels like you're zooming into or 
-;;                  out of the desktop; in practice, it's simply resizing 
-;;                  and moving the windows about, sometimes to locations 
-;;                  outside of the current screen resolution
+;; Move and resize windows by holding the Windows key and
+;; dragging with the mouse.
+;;
+;;    Win + Left mouse:  Move the window under the cursor
+;;    Win + Right mouse: Resize the window under the cursor
+;;
+;; - Drag a window to the top edge of a monitor and let go to maximize it
+;;   (a blue preview shows what will happen)
+;; - Grabbing a maximized window restores it first
+;; - Windows can't be shrunk below a minimum size, or grown beyond the screen
+;; - Windows can't be dragged completely off-screen
+;; - Fixed-size windows, fullscreen apps, the desktop and the taskbar are left alone
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 DetectHiddenWindows false
+SetWinDelay -1
+CoordMode "Mouse", "Screen"
+A_MaxHotkeysPerInterval := 1000
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; SETTINGS
+
+;; smallest size (pixels) a window can be shrunk to
+;; (a window that is already smaller than this can't shrink further, but can still grow)
+global MinWidth := 200
+global MinHeight := 120
+
+;; how many pixels of a window must stay on screen when you drag it towards an edge
+global KeepVisible := 100
+
+;; how close (pixels) the cursor has to be to the top of a monitor to maximize
+global SnapMargin := 3
+
+;; how far (pixels) you have to drag before a click turns into a drag
+;; (so a plain Win+click on a maximized window doesn't un-maximize it)
+global DragThreshold := 6
+
+;; how often (ms) the drag is updated
+global delay := 10
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; STATE
 
 global StartX := 0
 global StartY := 0
-
-global delay := 10
-global ZoomAmount := 0.30
-
-
+global PressX := 0
+global PressY := 0
 global Busy := false
-;; the last window we "grabbed" - so we don't accidentally grab another one during move/resize
+
+global DragActive := false
+global DragType := ""
+global DragMoved := false
+
+;; the window we "grabbed" - so we don't accidentally grab another one during move/resize
 global GrabbedWindow := ""
-;; whether we're in the right/left, top/bottom half of the window (for deciding which direction to resize)
-;; either "left"/"right"/""
+;; which half of the window we grabbed when resizing - "left"/"right"/"" and "top"/"bottom"/""
 global GrabbedHalfX := ""
-;; either "top"/"bottom"/""
 global GrabbedHalfY := ""
 
-coordmode "Mouse", "Screen"
+;; the window (and monitor number) that will be maximized if the mouse is released now
+global SnapWindow := ""
+global SnapMonitor := 0
 
-A_MaxHotkeysPerInterval := 1000
+;; the blue "this will be maximized" rectangle - click-through, never takes focus
+global PreviewGui := Gui("+AlwaysOnTop -Caption +ToolWindow -DPIScale +E0x80000 +E0x20 +E0x80 +E0x8000000", "DPaZ snap preview")
+PreviewGui.BackColor := "3B82F6"
+DllCall("SetLayeredWindowAttributes", "Ptr", PreviewGui.Hwnd, "UInt", 0, "UChar", 90, "UInt", 2)
+global PreviewRect := ""
+
+;; cancel any drag if the PC gets locked (we'd never see the mouse button being released)
+try {
+    DllCall("wtsapi32\WTSRegisterSessionNotification", "Ptr", A_ScriptHwnd, "UInt", 0)
+    OnMessage(0x2B1, OnSessionChange)
+}
+
+OnSessionChange(wParam, lParam, msg, hwnd) {
+    global DragType
+    if (wParam = 7) ; WTS_SESSION_LOCK
+        EndDrag(DragType, true)
+}
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; HOTKEYS
 
-
-; Hotkey for starting window pan
-#^MButton:: {
-    global StartX
-    global StartY
-    MouseGetPos &StartX, &StartY
-    SetTimer PanWindows, -delay
+#LButton:: {
+    StartDrag("move")
 }
-#^MButton Up:: {
-    SetTimer PanWindows, 0
+#LButton Up:: {
+    EndDrag("move")
 }
 
-#^LButton:: {
-    global StartX
-    global StartY
-    MouseGetPos &StartX, &StartY
-    SetTimer MoveWindow, -delay
+#RButton:: {
+    StartDrag("resize")
 }
-#^LButton Up:: {
-    global GrabbedWindow := ""
+#RButton Up:: {
+    EndDrag("resize")
+}
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; STARTING / ENDING A DRAG
+
+StartDrag(what) {
+    global StartX, StartY, PressX, PressY
+    global DragActive, DragType, DragMoved
+    global SnapWindow, SnapMonitor
+
+    ;; only one drag at a time (e.g. ignore the right button while moving with the left)
+    if (DragActive) {
+        ;; ...unless the old drag is clearly dead already
+        if (GetKeyState(DragType == "move" ? "LButton" : "RButton", "P"))
+            return
+        EndDrag(DragType, true)
+    }
+
+    ResetGrab()
+    MouseGetPos &StartX, &StartY
+    PressX := StartX
+    PressY := StartY
+    DragActive := true
+    DragType := what
+    DragMoved := false
+    SnapWindow := ""
+    SnapMonitor := 0
+
+    SetTimer(what == "move" ? MoveWindow : ResizeWindow, -delay)
+}
+
+EndDrag(what, cancel := false) {
+    global DragActive, DragType, SnapWindow, SnapMonitor
+
+    if (not DragActive || DragType != what)
+        return
+
+    DragActive := false
     SetTimer MoveWindow, 0
+    SetTimer ResizeWindow, 0
+    HideSnapPreview()
+
+    TargetWindow := SnapWindow
+    TargetMonitor := SnapMonitor
+    SnapWindow := ""
+    SnapMonitor := 0
+    ResetGrab()
+
+    if (what == "move" && TargetWindow && not cancel)
+        SnapMaximize(TargetWindow, TargetMonitor)
 }
 
-
-#^RButton:: {
-    global StartX
-    global StartY
-    MouseGetPos &StartX, &StartY
-    SetTimer ResizeWindow, -delay
-}
-#^RButton Up::{
+ResetGrab() {
     global GrabbedWindow := ""
     global GrabbedHalfX := ""
     global GrabbedHalfY := ""
-    SetTimer ResizeWindow, 0
-}
-
-
-#^WheelDown::ZoomWindows(-1)
-
-#^WheelUp::ZoomWindows(1)
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; ACTIONS
-
-ZoomWindows(zoom) {
-    global StartX
-    global StartY
-    MouseGetPos &StartX, &StartY
-    DoStuffToWindows("zoom", zoom)
-
-    GuiHwnd := WinExist()
-}
-
-PanWindows() {
-    DoStuffToWindows("pan", 1)
 }
 
 MoveWindow() {
-    DoStuffToWindows("move", 1)
+    DoStuffToWindows("move")
 }
 
 ResizeWindow() {
-    DoStuffToWindows("resize", 1)
+    DoStuffToWindows("resize")
 }
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; MAGIC
 
-DoStuffToWindows(what, multiplier) {
-    SetWinDelay -1
-    global StartX
-    global StartY
-    global Busy
-    global GrabbedWindow
-    global GrabbedHalfX
-    global GrabbedHalfY
+DoStuffToWindows(what) {
+    ;; don't let the mouse-up hotkey butt in half way through an update
+    Critical
 
-    switch what {
-        case "move": 
-            if not GetKeyState("LButton", "P")
-                return
-        case "pan": 
-            if not GetKeyState("MButton", "P")
-                return
-        case "resize": 
-            if not GetKeyState("RButton", "P")
-                return
+    global StartX, StartY, PressX, PressY, Busy
+    global DragActive, DragType, DragMoved
+    global GrabbedWindow, GrabbedHalfX, GrabbedHalfY
+    global SnapWindow, SnapMonitor
+    global MinWidth, MinHeight, KeepVisible, DragThreshold
+
+    ;; a stray timer from a drag that's already over
+    if (not DragActive || DragType != what)
+        return
+
+    ;; mouse button isn't held any more - the drag is over
+    Button := (what == "move") ? "LButton" : "RButton"
+    if not GetKeyState(Button, "P") {
+        EndDrag(what)
+        return
     }
 
-    if (MouseClickDrag)
-
     ;; if we're already doing something to the window, don't try and clobber it
-    if (Busy) 
+    if (Busy)
         return
     Busy := true
 
-    ; Get the current mouse position
-    MouseGetPos &MouseX, &MouseY, &WindowUnderCursor
+    NextStartX := StartX
+    NextStartY := StartY
 
-    ; Calculate the offset
-    OffsetX := MouseX - StartX
-    OffsetY := MouseY - StartY
+    WS_MAXIMIZE := 0x1000000
+    WS_MAXIMIZEBOX := 0x10000
+    WS_THICKFRAME := 0x40000
 
-    ;; Get the list of window ids to affect; different actions have different criteria
-    WindowIds := []
-    if (what == "resize" || what == "move") {
-        ; only applies to window under the cursor
+    try {
+        MouseGetPos &MouseX, &MouseY, &WindowUnderCursor
+        NextStartX := MouseX
+        NextStartY := MouseY
+
+        ;; has the mouse really been dragged, or is it just a click so far?
+        if (not DragMoved && (Abs(MouseX - PressX) >= DragThreshold || Abs(MouseY - PressY) >= DragThreshold))
+            DragMoved := true
+
         if (not GrabbedWindow)
             GrabbedWindow := WindowUnderCursor
-        WindowIds := [GrabbedWindow]
-    }
-    else {
-        ;; applying to all windows (zoom and pan)
-        ; WindowIds := WinGetList("Notepad") ; for testing
-        WindowIds := WinGetList(,, "Program Manager")
-    }
+        Window := GrabbedWindow
 
-    ;; remove "bad" windows from our list - either removed windows, or windows that are too small, minimised, hidden etc
-    NewWindowIds := []
-    for window in WindowIds {
-        ;; window has been removed since we started the loop?
-        if not WinExist(window)
-            continue
+        if (Window && WinExist(Window)) {
+            WinGetPos(&X, &Y, &W, &H, Window)
 
-        WinGetPos(&WindowX, &WindowY, &WindowWidth, &WindowHeight, window)
-        if ( not IsGoodWindow(window, WindowWidth, WindowHeight))
-            continue
+            if (IsGoodWindow(Window, X, Y, W, H)) {
+                Style := WinGetStyle(Window)
 
-        NewWindowIds.Push(window)
-    }
+                if (Style & WS_MAXIMIZE) {
+                    ;; a maximized window: once the mouse really moves, restore it and put it under
+                    ;; the cursor so the cursor stays at the same relative spot on the window
+                    if (DragMoved) {
+                        FracX := Min(Max((MouseX - X) / W, 0), 1)
+                        FracY := Min(Max((MouseY - Y) / H, 0), 1)
+                        WinRestore(Window)
+                        WinGetPos(&X, &Y, &W, &H, Window)
+                        MoveAndResize(Round(MouseX - FracX * W), Round(MouseY - FracY * H), , , Window)
+                    }
+                }
+                else {
+                    ;; size of the whole desktop (all monitors)
+                    VL := SysGet(76)
+                    VT := SysGet(77)
+                    VW := SysGet(78)
+                    VH := SysGet(79)
 
-    ;; Loop through the windows and "do stuff" to them
-    for window in NewWindowIds {
-        WinGetPos(&WindowX, &WindowY, &WindowWidth, &WindowHeight, window)
+                    if (what == "move") {
+                        NewX := X + (MouseX - StartX)
+                        NewY := Y + (MouseY - StartY)
 
-        ;; Otherwise, we're good to go
-        if (what == "zoom") {
-            ; apply a static zoom on each iteration
-            scale := 1 + (multiplier * ZoomAmount)
+                        ;; don't let the window get lost off-screen
+                        KeepX := Min(KeepVisible, W)
+                        KeepY := Min(KeepVisible, H)
+                        NewX := Max(VL - W + KeepX, Min(NewX, VL + VW - KeepX))
+                        NewY := Max(VT, Min(NewY, VT + VH - KeepY))
 
-            ; then get a vector from current mouse pos to the center of the window
-            ; now move the center of the window to the end point of the scaled vector
-            global Center := [WindowWidth / 2, WindowHeight / 2]
-            global Vector := [(WindowX + Center[1]) - MouseX, (WindowY + Center[2]) - MouseY]
-            ; scale the vector, but keep the origin the same
-            global Scaled := [Vector[1] * scale, Vector[2] * scale]
-            global NewPos := [MouseX + Scaled[1] - (Center[1] * scale), MouseY + Scaled[2] - (Center[2] * scale)]
+                        MoveAndResize(NewX, NewY, , , Window)
 
-            MoveAndResize(NewPos[1], NewPos[2], WindowWidth * scale, WindowHeight * scale, window)
-        }
-        else if (what == "resize") {
-            ;; figure out which quarter of the window we're in so we can "drag" that corner
-            ;; essentially moves the window minus amount, and increases its size in the opposite direction
-            ;; so the opposite corner doesn't move
-            if (not GrabbedHalfX || not GrabbedHalfY) {
-                GrabbedHalfX := "right"
-                GrabbedHalfY := "bottom"
-                if (MouseX < WindowX + WindowWidth / 2) 
-                    GrabbedHalfX := "left"
-                if (MouseY < WindowY + WindowHeight / 2)
-                    GrabbedHalfY := "top"
+                        ;; only "use up" the movement that was actually applied, so the window
+                        ;; doesn't jump when the cursor comes back from beyond a screen edge
+                        NextStartX := StartX + (NewX - X)
+                        NextStartY := StartY + (NewY - Y)
+
+                        ;; at the top edge of a monitor? then letting go will maximize
+                        Mon := GetSnapMonitor(MouseX, MouseY)
+                        if (Mon && DragMoved && (Style & WS_MAXIMIZEBOX)) {
+                            SnapWindow := Window
+                            SnapMonitor := Mon
+                            ShowSnapPreview(Mon)
+                        }
+                        else {
+                            SnapWindow := ""
+                            SnapMonitor := 0
+                            HideSnapPreview()
+                        }
+                    }
+                    else if (Style & WS_THICKFRAME) {
+                        ;; resizing - only for windows that have a resizable border
+
+                        ;; figure out which quarter of the window we're in so we can "drag" that corner
+                        if (not GrabbedHalfX || not GrabbedHalfY) {
+                            GrabbedHalfX := (MouseX < X + W / 2) ? "left" : "right"
+                            GrabbedHalfY := (MouseY < Y + H / 2) ? "top" : "bottom"
+                        }
+
+                        ;; how much the mouse moved, in the direction that grows the window
+                        DeltaX := MouseX - StartX
+                        DeltaY := MouseY - StartY
+                        if (GrabbedHalfX == "left")
+                            DeltaX *= -1
+                        if (GrabbedHalfY == "top")
+                            DeltaY *= -1
+
+                        ;; new size: not smaller than the minimum, not bigger than the desktop
+                        ;; (windows already outside those limits are never forced to change by the limit)
+                        NewW := Min(Max(W + DeltaX, Min(MinWidth, W)), Max(VW, W))
+                        NewH := Min(Max(H + DeltaY, Min(MinHeight, H)), Max(VH, H))
+
+                        ;; keep the opposite corner fixed
+                        NewX := (GrabbedHalfX == "left") ? X + W - NewW : X
+                        NewY := (GrabbedHalfY == "top") ? Y + H - NewH : Y
+                        MoveAndResize(NewX, NewY, NewW, NewH, Window)
+
+                        ;; the app may have refused the size we asked for (its own min/max size) - see what we got
+                        WinGetPos(, , &ActualW, &ActualH, Window)
+                        if (ActualW != NewW || ActualH != NewH) {
+                            NewX := (GrabbedHalfX == "left") ? X + W - ActualW : X
+                            NewY := (GrabbedHalfY == "top") ? Y + H - ActualH : Y
+                            MoveAndResize(NewX, NewY, , , Window)
+                        }
+
+                        ;; only "use up" the mouse movement that actually changed the window
+                        AppliedX := ActualW - W
+                        AppliedY := ActualH - H
+                        if (GrabbedHalfX == "left")
+                            AppliedX *= -1
+                        if (GrabbedHalfY == "top")
+                            AppliedY *= -1
+                        NextStartX := StartX + AppliedX
+                        NextStartY := StartY + AppliedY
+                    }
+                }
+
+                SetTimer(ResumeRedraw.Bind(Window), -delay)
             }
-
-            if (GrabbedHalfX == "left") {
-                OffsetX *= -1
-                WindowX -= OffsetX
-            }
-            if (GrabbedHalfY == "top") {
-                OffsetY *= -1
-                WindowY -= OffsetY
-            }
-            MoveAndResize(WindowX, WindowY, WindowWidth + OffsetX, WindowHeight + OffsetY, window)
-        }
-        else if (what == "move" || what == "pan") {
-            MoveAndResize((WindowX + OffsetX), (WindowY + OffsetY), , , window)
         }
     }
-
-    for window in NewWindowIds {
-        SetTimer(ResumeRedraw.Bind(window), -delay)
+    catch {
+        ;; the window probably disappeared mid-drag, or it is not allowed to be touched
+        ;; (e.g. an elevated window) - nothing sensible to do, just carry on
+    }
+    finally {
+        ;; whatever happened, make sure the script can never get "stuck"
+        StartX := NextStartX
+        StartY := NextStartY
+        Busy := false
     }
 
-    ; Update the start position for the next calculation
-    StartX := MouseX
-    StartY := MouseY
-
-    if (what == "pan")
-        SetTimer PanWindows, -delay
-    if (what == "move")
-        SetTimer MoveWindow, -delay
-    if (what == "resize")
-        SetTimer ResizeWindow, -delay
-    
-    Busy := false
+    if (DragActive)
+        SetTimer(what == "move" ? MoveWindow : ResizeWindow, -delay)
 }
 
-PauseRedraw(window) {
-    ; SendMessage(0xB, 0, 0,, window) ; wParam 0 disables redraw
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; SNAP TO TOP (MAXIMIZE)
+
+;; Returns the number of the monitor whose top edge the cursor is pushing against, or 0.
+;; If another monitor sits directly above that spot, the cursor can just carry on up
+;; onto it, so that's not an "edge" and we return 0.
+GetSnapMonitor(MouseX, MouseY) {
+    global SnapMargin
+    Loop MonitorGetCount() {
+        MonitorGet(A_Index, &ML, &MT, &MR, &MB)
+        if (MouseX >= ML && MouseX < MR && MouseY >= MT && MouseY < MB) {
+            if (MouseY > MT + SnapMargin)
+                return 0
+            if (PointOnAnyMonitor(MouseX, MT - 1))
+                return 0
+            return A_Index
+        }
+    }
+    return 0
 }
+
+PointOnAnyMonitor(PX, PY) {
+    Loop MonitorGetCount() {
+        MonitorGet(A_Index, &ML, &MT, &MR, &MB)
+        if (PX >= ML && PX < MR && PY >= MT && PY < MB)
+            return true
+    }
+    return false
+}
+
+ShowSnapPreview(MonitorNumber) {
+    global PreviewGui, PreviewRect
+    MonitorGetWorkArea(MonitorNumber, &L, &T, &R, &B)
+    Rect := L "," T "," R "," B
+    if (Rect == PreviewRect)
+        return
+    PreviewRect := Rect
+    PreviewGui.Show(Format("NA x{} y{} w{} h{}", L, T, R - L, B - T))
+}
+
+HideSnapPreview() {
+    global PreviewGui, PreviewRect
+    if (PreviewRect == "")
+        return
+    PreviewRect := ""
+    PreviewGui.Hide()
+}
+
+SnapMaximize(window, MonitorNumber) {
+    WS_MAXIMIZE := 0x1000000
+    try {
+        if (not WinExist(window))
+            return
+        if (WinGetStyle(window) & WS_MAXIMIZE)
+            return
+
+        ;; Windows maximizes a window onto whichever monitor it mostly sits on. Make sure that's the
+        ;; monitor the cursor is on (matters when the window is wider than the monitor it's pushed up against).
+        MonitorGet(MonitorNumber, &ML, &MT, &MR, &MB)
+        WinGetPos(&X, &Y, &W, &H, window)
+        NewX := Max(ML, Min(X, MR - W))
+        NewY := Max(MT, Min(Y, MB - H))
+        if (NewX != X || NewY != Y)
+            MoveAndResize(NewX, NewY, , , window)
+
+        WinMaximize(window)
+    }
+    catch {
+        ;; window vanished, or we're not allowed to touch it
+    }
+}
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; HELPERS
 
 ResumeRedraw(window) {
-    SendMessage(0xB, 1, 0,, window) ; wParam 1 enables redraw
-    ; force a redraw
-    DllCall("RedrawWindow", "Ptr", WinExist(window), "Ptr", 0, "Ptr", 0, "UInt", 0x85)
+    try {
+        SendMessage(0xB, 1, 0, , window) ; wParam 1 enables redraw
+        ; force a redraw
+        DllCall("RedrawWindow", "Ptr", WinExist(window), "Ptr", 0, "Ptr", 0, "UInt", 0x85)
+    }
+    catch {
+        ;; window closed in the meantime
+    }
 }
 
-IsGoodWindow(window, WindowWidth, WindowHeight) {
-    ;; Skip tiny windows
-    if (WindowWidth < 2 || WindowHeight < 2)
-        return false
+IsGoodWindow(window, X, Y, W, H) {
+    try {
+        ;; Skip tiny windows
+        if (W < 2 || H < 2)
+            return false
 
-    ;; Skip disabled or minimized windows
-    Style := WinGetStyle(window)
-    WS_DISABLED := 0x8000000
-    WS_MINIMIZE := 0x20000000
-    if (Style & WS_DISABLED || Style & WS_MINIMIZE) {
+        ;; Skip the desktop, taskbar, and other parts of the Windows shell
+        WinClassName := WinGetClass(window)
+        for shellClass in ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"
+                         , "Windows.UI.Core.CoreWindow", "NotifyIconOverflowWindow"
+                         , "TopLevelWindowForOverflowXamlIsland"] {
+            if (WinClassName = shellClass)
+                return false
+        }
+
+        ;; Skip disabled or minimized windows
+        Style := WinGetStyle(window)
+        WS_DISABLED := 0x8000000
+        WS_MINIMIZE := 0x20000000
+        if (Style & WS_DISABLED || Style & WS_MINIMIZE)
+            return false
+
+        ;; Skip fullscreen apps (games, videos): no title bar and covering a whole monitor
+        WS_CAPTION := 0xC00000
+        WS_MAXIMIZE := 0x1000000
+        if (not (Style & WS_CAPTION) && not (Style & WS_MAXIMIZE)) {
+            Loop MonitorGetCount() {
+                MonitorGet(A_Index, &ML, &MT, &MR, &MB)
+                if (X <= ML && Y <= MT && X + W >= MR && Y + H >= MB)
+                    return false
+            }
+        }
+
+        ;; Skip fully transparent windows
+        Trans := WinGetTransparent(window)
+        if (Trans == 0)
+            return false
+
+        ;; Skip windows with no title
+        Title := WinGetTitle(window)
+        if (Title == "" || Title == "Transparent Window")
+            return false
+
+        return true
+    }
+    catch {
+        ;; window vanished while we were looking at it
         return false
     }
-
-    ;; Skip fully transparent windows
-    Trans := WinGetTransparent(window)
-    if (Trans == 0) 
-        return false
-
-    ;; Skip windows with no title
-    Title := WinGetTitle(window)
-    if (Title == "" || Title == "Transparent Window") 
-        return false
-
-    return true
 }
 
 MoveAndResize(WindowX, WindowY, WindowWidth := "", WindowHeight := "", Window := "") {
+    ;; Note: SWP_NOSENDCHANGING is deliberately NOT used, so that windows get to apply
+    ;; their own minimum/maximum size limits instead of being forced to any size.
     SWP_NOREDRAW := 0x0008
-    SWP_NOSENDCHANGING := 0x0400
     SWP_DEFERERASE := 0x2000
     SWP_NOCOPYBITS := 0x0100
     SWP_NOZORDER := 0x0004
-    Flags := SWP_NOREDRAW | SWP_NOSENDCHANGING | SWP_DEFERERASE | SWP_NOCOPYBITS | SWP_NOZORDER
+    Flags := SWP_NOREDRAW | SWP_DEFERERASE | SWP_NOCOPYBITS | SWP_NOZORDER
     try {
         if (WindowWidth && WindowHeight) {
-            ; SWP_gcc
-            DllCall("SetWindowPos", "UInt", Window, "UInt", 0, "Int", WindowX, "Int", WindowY, "Int", WindowWidth, "Int", WindowHeight, "UInt", Flags)
-            ; WinMove(WindowX, WindowY, WindowWidth, WindowHeight, window)
+            DllCall("SetWindowPos", "Ptr", Window, "Ptr", 0, "Int", Round(WindowX), "Int", Round(WindowY), "Int", Round(WindowWidth), "Int", Round(WindowHeight), "UInt", Flags)
         }
         else {
             SWP_NOSIZE := 0x0001
             Flags |= SWP_NOSIZE
-            DllCall("SetWindowPos", "UInt", Window, "UInt", 0, "Int", WindowX, "Int", WindowY, "Int", 0, "Int", 0, "UInt", Flags)
-            ; WinMove(WindowX, WindowY, , , Window)
+            DllCall("SetWindowPos", "Ptr", Window, "Ptr", 0, "Int", Round(WindowX), "Int", Round(WindowY), "Int", 0, "Int", 0, "UInt", Flags)
         }
     }
     catch {
         ;; not a lot we can do here...
     }
-}
-
-Canvas_DrawLine(p_x1, p_y1, p_x2, p_y2) {
-    hDC := DllCall("GetDC", "UInt", 0)
-    hCurrPen := DllCall("CreatePen", "UInt", 0, "UInt", 2, "UInt", 0xff0000)
-    DllCall("SelectObject", "UInt", hdc, "UInt", hCurrPen)
-    DllCall("gdi32.dll\MoveToEx", "UInt", hdc, "UInt", p_x1, "UInt", p_y1, "UInt", 0)
-    DllCall("gdi32.dll\LineTo", "UInt", hdc, "UInt", p_x2, "UInt", p_y2)
-    DllCall("ReleaseDC", "uint", 0, "uint", hDC)
-    DllCall("DeleteObject", "UInt", hCurrPen)
 }
