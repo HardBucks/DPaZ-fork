@@ -37,7 +37,7 @@ global MinHeight := 120
 global KeepVisible := 100
 
 ;; how close (pixels) the cursor has to be to the top of a monitor to maximize
-global SnapMargin := 3
+global SnapMargin := 30
 
 ;; how far (pixels) you have to drag before a click turns into a drag
 ;; (so a plain Win+click on a maximized window doesn't un-maximize it)
