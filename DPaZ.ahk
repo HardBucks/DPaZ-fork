@@ -5,16 +5,19 @@
 ;; Move and resize windows by holding the Windows key and
 ;; dragging with the mouse.
 ;; Based on DPaZ by sebmaynard
-;; Modified by HardBucks (with Claude)
+;; Modified by Claude
 ;;
 ;;    Win + Left mouse:  Move the window under the cursor
 ;;    Win + Right mouse: Resize the window under the cursor
+;;    Win + Middle mouse: Close the window under the cursor (a normal close, like the X button)
 ;;
-;; - Drag a window to the top edge of a monitor and let go to maximize it
-;;   (a blue preview shows what will happen)
+;; - Drag a window until its edge hits a side or corner of the monitor, then let go to snap it:
+;;   top = maximize, left / right = half the screen, corners = a quarter of the screen
+;;   (a see-through preview shows where it will go)
 ;; - Grabbing a maximized window restores it first
 ;; - The mouse cursor changes while you drag (move arrows, or a diagonal
 ;;   resize arrow that matches the corner you grabbed)
+;; - Dragging updates once per screen refresh, so it's as smooth as your monitor (100 Hz = 100 updates/sec)
 ;; - Windows can't be shrunk below a minimum size, or grown beyond the screen
 ;; - Windows can't be dragged completely off-screen
 ;; - Fixed-size windows, fullscreen apps, the desktop and the taskbar are left alone
@@ -36,8 +39,13 @@ global MinHeight := 120
 ;; how many pixels of a window must stay on screen when you drag it towards an edge
 global KeepVisible := 100
 
-;; how close (pixels) the cursor has to be to the top of a monitor to maximize
-global SnapMargin := 30
+;; how close (pixels) the edge of a window has to get to the edge of the monitor to snap
+global SnapMargin := 3
+
+;; the see-through preview shown while a window is about to snap
+global PreviewColor := "BCCCE4"
+global PreviewOpacity := 120   ; 0 (invisible) to 255 (solid)
+global PreviewRadius := 8      ; how round the corners are, 0 = square
 
 ;; how far (pixels) you have to drag before a click turns into a drag
 ;; (so a plain Win+click on a maximized window doesn't un-maximize it)
@@ -47,8 +55,9 @@ global DragThreshold := 6
 ;; false = leave focus and the window order alone while dragging
 global FocusOnDrag := true
 
-;; how often (ms) the drag is updated
-global delay := 10
+;; true  = update the window once per screen refresh (smoothest, follows your monitor's refresh rate)
+;; false = update on a fixed 10 ms timer instead - use this if the sync ever causes trouble
+global SyncToRefresh := true
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; STATE
@@ -62,6 +71,8 @@ global Busy := false
 global DragActive := false
 global DragType := ""
 global DragMoved := false
+;; goes up by one for every drag, so a loop left over from an old drag can tell it's out of date
+global DragId := 0
 ;; have we already focused the window for this drag?
 global DragFocused := false
 
@@ -79,12 +90,38 @@ global GrabMaxH := 0
 ;; the window (and monitor number) that will be maximized if the mouse is released now
 global SnapWindow := ""
 global SnapMonitor := 0
+;; ...and where it will go: "top", "left", "right", "topleft", "topright", "bottomleft" or "bottomright"
+global SnapZone := ""
+;; the zone the window was in when the drag started. A window that starts out against an edge doesn't
+;; snap until it has been somewhere else first (so sliding it along the edge doesn't snap it)
+global SnapStartZone := ""
+global SnapZoneInit := false
+global SnapArmed := false
+;; how many frames in a row the window has been outside every zone (see the snap check)
+global SnapGrace := 0
 
-;; the blue "this will be maximized" rectangle - click-through, never takes focus
+;; windows we snapped to a half/quarter: window -> [old width, old height, snapped x, y, width, height]
+;; so that dragging one away gives it its old size back
+global SnappedWindows := Map()
+
+;; The snap preview: two plain click-through windows that never take focus - a thin light ring
+;; (the border) and the see-through fill inside it. Plain solid-colour windows don't flicker when they
+;; are moved or resized, which a window with a control inside it does.
+global PreviewBorder := 2
 global PreviewGui := Gui("+AlwaysOnTop -Caption +ToolWindow -DPIScale +E0x80000 +E0x20 +E0x80 +E0x8000000", "DPaZ snap preview")
-PreviewGui.BackColor := "3B82F6"
-DllCall("SetLayeredWindowAttributes", "Ptr", PreviewGui.Hwnd, "UInt", 0, "UChar", 90, "UInt", 2)
-global PreviewRect := ""
+PreviewGui.BackColor := "FFFFFF"
+DllCall("SetLayeredWindowAttributes", "Ptr", PreviewGui.Hwnd, "UInt", 0, "UChar", PreviewOpacity, "UInt", 2)
+global PreviewFillGui := Gui("+AlwaysOnTop -Caption +ToolWindow -DPIScale +E0x80000 +E0x20 +E0x80 +E0x8000000", "DPaZ snap preview fill")
+PreviewFillGui.BackColor := PreviewColor
+DllCall("SetLayeredWindowAttributes", "Ptr", PreviewFillGui.Hwnd, "UInt", 0, "UChar", PreviewOpacity, "UInt", 2)
+;; "" when hidden, otherwise which zone/monitor it is showing
+global PreviewKey := ""
+;; where the preview is now, and where it is growing towards: [x, y, width, height]
+global PreviewCur := [0, 0, 0, 0]
+global PreviewDst := [0, 0, 0, 0]
+;; what was last applied to the windows, so we only touch them when something really changed
+global PreviewShown := ""
+global PreviewShownSize := ""
 
 ;; which cursor we're showing right now: "" (the normal ones), "move", "nwse" or "nesw"
 global CursorState := ""
@@ -127,12 +164,16 @@ OnSessionChange(wParam, lParam, msg, hwnd) {
     EndDrag("resize")
 }
 
+#MButton:: {
+    CloseWindowUnderCursor()
+}
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; STARTING / ENDING A DRAG
 
 StartDrag(what) {
     global StartX, StartY, PressX, PressY
-    global DragActive, DragType, DragMoved
+    global DragActive, DragType, DragMoved, DragId
     global SnapWindow, SnapMonitor
 
     ;; only one drag at a time (e.g. ignore the right button while moving with the left)
@@ -153,29 +194,31 @@ StartDrag(what) {
     SnapWindow := ""
     SnapMonitor := 0
 
-    SetTimer(what == "move" ? MoveWindow : ResizeWindow, -delay)
+    ;; the drag itself runs as a loop (started from a timer so this hotkey can finish straight away)
+    DragId += 1
+    SetTimer(DragLoop.Bind(what, DragId), -1)
 }
 
 EndDrag(what, cancel := false) {
-    global DragActive, DragType, SnapWindow, SnapMonitor
+    global DragActive, DragType, SnapWindow, SnapMonitor, SnapZone
 
     if (not DragActive || DragType != what)
         return
 
     DragActive := false
-    SetTimer MoveWindow, 0
-    SetTimer ResizeWindow, 0
     HideSnapPreview()
     RestoreCursor()
 
     TargetWindow := SnapWindow
     TargetMonitor := SnapMonitor
+    TargetZone := SnapZone
     SnapWindow := ""
     SnapMonitor := 0
+    SnapZone := ""
     ResetGrab()
 
-    if (what == "move" && TargetWindow && not cancel)
-        SnapMaximize(TargetWindow, TargetMonitor)
+    if (what == "move" && TargetWindow && TargetZone != "" && not cancel)
+        SnapWindowTo(TargetWindow, TargetZone, TargetMonitor)
 }
 
 ResetGrab() {
@@ -187,29 +230,88 @@ ResetGrab() {
     global GrabMinH := 0
     global GrabMaxH := 0
     global DragFocused := false
+    global SnapArmed := false
+    global SnapZoneInit := false
+    global SnapStartZone := ""
+    global SnapZone := ""
+    global SnapGrace := 0
 }
 
-MoveWindow() {
-    DoStuffToWindows("move")
+;; The drag runs as one loop with one update per screen refresh, instead of a timer.
+;; (Windows timers tick roughly every 15 ms and unevenly, which is what made it stutter on a 100 Hz monitor.)
+DragLoop(what, Id) {
+    global DragActive, DragType, DragId, PreviewKey
+
+    while (DragActive && DragType == what && DragId == Id) {
+        ;; an update can't be interrupted half way through...
+        Critical "On"
+        try {
+            DoStuffToWindows(what)
+            if (PreviewKey != "")
+                PreviewAnimate()
+        }
+        catch {
+            ;; never let one bad update kill the whole drag
+        }
+        Critical "Off"
+
+        ;; ...but in between, other things (like the mouse-up hotkey) get their turn
+        WaitForFrame()
+    }
 }
 
-ResizeWindow() {
-    DoStuffToWindows("resize")
+WaitForFrame() {
+    global SyncToRefresh
+
+    if (SyncToRefresh) {
+        ;; DwmFlush waits for the next screen refresh. If it can't, fall back to a short sleep.
+        if (DllCall("dwmapi\DwmFlush") != 0)
+            Sleep 8
+    }
+    else {
+        Sleep 10
+    }
+    ;; let any waiting hotkeys / messages run
+    Sleep -1
+}
+
+CloseWindowUnderCursor() {
+    global DragActive
+
+    ;; not while a move/resize is going on - we'd close the window being dragged
+    if (DragActive)
+        return
+
+    try {
+        MouseGetPos(, , &Window)
+        if (not Window || not WinExist(Window))
+            return
+
+        ;; same "is this a normal window" rules as dragging: never the desktop, taskbar,
+        ;; Start menu, fullscreen games and so on
+        WinGetPos(&X, &Y, &W, &H, Window)
+        if (not IsGoodWindow(Window, X, Y, W, H))
+            return
+
+        ;; a normal close, exactly like clicking the X - the app can still ask to save first
+        WinClose(Window)
+    }
+    catch {
+        ;; window vanished, nothing to do
+    }
 }
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; MAGIC
 
 DoStuffToWindows(what) {
-    ;; don't let the mouse-up hotkey butt in half way through an update
-    Critical
-
     global StartX, StartY, PressX, PressY, Busy
     global DragActive, DragType, DragMoved
     global GrabbedWindow, GrabbedHalfX, GrabbedHalfY
     global SnapWindow, SnapMonitor
     global GrabMinW, GrabMaxW, GrabMinH, GrabMaxH
-    global FocusOnDrag, DragFocused
+    global FocusOnDrag, DragFocused, SnapArmed, SnapMargin
+    global SnapZone, SnapStartZone, SnapZoneInit, SnappedWindows, SnapGrace
     global MinWidth, MinHeight, KeepVisible, DragThreshold
 
     ;; a stray timer from a drag that's already over
@@ -264,6 +366,21 @@ DoStuffToWindows(what) {
                     FocusWindow(Window)
                 }
 
+                ;; did we snap this window, and is it still exactly where we left it?
+                WasSnapped := false
+                if (SnappedWindows.Has(Window)) {
+                    SnapInfo := SnappedWindows[Window]
+                    if (Abs(X - SnapInfo[3]) <= 2 && Abs(Y - SnapInfo[4]) <= 2 && Abs(W - SnapInfo[5]) <= 2 && Abs(H - SnapInfo[6]) <= 2)
+                        WasSnapped := true
+                    else
+                        SnappedWindows.Delete(Window)
+                }
+                if (WasSnapped && what == "resize") {
+                    ;; resizing a snapped window just makes it a normal window again
+                    SnappedWindows.Delete(Window)
+                    WasSnapped := false
+                }
+
                 if (Style & WS_MAXIMIZE) {
                     ;; a maximized window: once the mouse really moves, restore it and put it under
                     ;; the cursor so the cursor stays at the same relative spot on the window
@@ -281,6 +398,16 @@ DoStuffToWindows(what) {
                         finally {
                             SetWindowAnimations(Window, true)
                         }
+                    }
+                }
+                else if (WasSnapped) {
+                    ;; a snapped window being moved: once the mouse really moves, give it its old size back
+                    ;; (the same way a maximized window gets restored)
+                    if (DragMoved) {
+                        FracX := Min(Max((MouseX - X) / W, 0), 1)
+                        FracY := Min(Max((MouseY - Y) / H, 0), 1)
+                        SnappedWindows.Delete(Window)
+                        MoveAndResize(Round(MouseX - FracX * SnapInfo[1]), Round(MouseY - FracY * SnapInfo[2]), SnapInfo[1], SnapInfo[2], Window)
                     }
                 }
                 else {
@@ -307,16 +434,44 @@ DoStuffToWindows(what) {
                         NextStartX := StartX + (NewX - X)
                         NextStartY := StartY + (NewY - Y)
 
-                        ;; at the top edge of a monitor? then letting go will maximize
-                        Mon := GetSnapMonitor(MouseX, MouseY)
-                        if (Mon && DragMoved && (Style & WS_MAXIMIZEBOX)) {
+                        ;; has the window been pushed against a side or corner of the monitor the cursor is on?
+                        ;; then letting go will snap it there
+                        Mon := GetMonitorAt(MouseX, MouseY)
+                        Zone := ""
+                        if (Mon) {
+                            MonitorGet(Mon, &ML, &MT, &MR, &MB)
+                            GetFrameInsets(Window, X, Y, W, H, &IL, &IT, &IR, &IB)
+                            Zone := GetSnapZone(NewX + IL, NewY + IT, NewX + W - IR, NewY + H - IB, ML, MT, MR, MB, MouseY, SnapZone)
+                        }
+
+                        ;; a window that starts out against an edge has to leave it before it can snap
+                        if (not SnapZoneInit) {
+                            SnapZoneInit := true
+                            SnapStartZone := Zone
+                        }
+                        if (Zone == "" || Zone != SnapStartZone)
+                            SnapArmed := true
+
+                        ;; top = maximize, which needs a maximize button. The rest need a resizable border.
+                        CanSnap := (Zone == "top") ? (Style & WS_MAXIMIZEBOX) : (Style & WS_THICKFRAME)
+
+                        if (Zone != "" && SnapArmed && DragMoved && CanSnap) {
+                            SnapGrace := 0
                             SnapWindow := Window
                             SnapMonitor := Mon
-                            ShowSnapPreview(Mon)
+                            SnapZone := Zone
+                            ShowSnapPreview(Zone, Mon, Window)
+                        }
+                        else if (SnapWindow && SnapGrace < 4) {
+                            ;; outside every zone for a frame or two - most likely a wobble right at the
+                            ;; edge, so keep the preview up instead of hiding it and showing it again
+                            SnapGrace += 1
                         }
                         else {
+                            SnapGrace := 0
                             SnapWindow := ""
                             SnapMonitor := 0
+                            SnapZone := ""
                             HideSnapPreview()
                         }
                     }
@@ -405,28 +560,17 @@ DoStuffToWindows(what) {
         StartY := NextStartY
         Busy := false
     }
-
-    if (DragActive)
-        SetTimer(what == "move" ? MoveWindow : ResizeWindow, -delay)
 }
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; SNAP TO TOP (MAXIMIZE)
 
-;; Returns the number of the monitor whose top edge the cursor is pushing against, or 0.
-;; If another monitor sits directly above that spot, the cursor can just carry on up
-;; onto it, so that's not an "edge" and we return 0.
-GetSnapMonitor(MouseX, MouseY) {
-    global SnapMargin
+;; Returns the number of the monitor the point is on, or 0.
+GetMonitorAt(PX, PY) {
     Loop MonitorGetCount() {
         MonitorGet(A_Index, &ML, &MT, &MR, &MB)
-        if (MouseX >= ML && MouseX < MR && MouseY >= MT && MouseY < MB) {
-            if (MouseY > MT + SnapMargin)
-                return 0
-            if (PointOnAnyMonitor(MouseX, MT - 1))
-                return 0
+        if (PX >= ML && PX < MR && PY >= MT && PY < MB)
             return A_Index
-        }
     }
     return 0
 }
@@ -440,22 +584,214 @@ PointOnAnyMonitor(PX, PY) {
     return false
 }
 
-ShowSnapPreview(MonitorNumber) {
-    global PreviewGui, PreviewRect
+;; Works out which snap zone a window is in, given where its visible edges are and the monitor's edges.
+;; Returns "top", "left", "right", "topleft", "topright", "bottomleft", "bottomright" or "".
+GetSnapZone(VisLeft, VisTop, VisRight, VisBottom, ML, MT, MR, MB, CursorY, PrevZone := "") {
+    global SnapMargin
+
+    ;; once a window is in a zone it takes a bit more to leave it again. Without that, a window sitting
+    ;; right on the margin flips in and out every frame, and the preview flickers.
+    Extra := 8
+    AtLeft := (VisLeft <= ML + SnapMargin + (InStr(PrevZone, "left") ? Extra : 0))
+    AtRight := (VisRight >= MR - SnapMargin - (InStr(PrevZone, "right") ? Extra : 0))
+    AtTop := (VisTop <= MT + SnapMargin + (InStr(PrevZone, "top") ? Extra : 0))
+    AtBottom := (VisBottom >= MB - SnapMargin - (InStr(PrevZone, "bottom") ? Extra : 0))
+
+    ;; a window as wide (or tall) as the monitor touches both sides, which tells us nothing
+    if (AtLeft && AtRight) {
+        AtLeft := false
+        AtRight := false
+    }
+    if (AtTop && AtBottom)
+        AtBottom := false
+
+    Vertical := AtTop ? "top" : (AtBottom ? "bottom" : "")
+    Horizontal := AtLeft ? "left" : (AtRight ? "right" : "")
+
+    ;; a plain left/right edge doesn't count if there's another monitor on the other side of it - then
+    ;; you're just dragging the window across onto that monitor. The corners still count though.
+    if (Vertical == "") {
+        if (Horizontal == "left" && PointOnAnyMonitor(ML - 1, CursorY))
+            Horizontal := ""
+        if (Horizontal == "right" && PointOnAnyMonitor(MR, CursorY))
+            Horizontal := ""
+    }
+
+    ;; the bottom edge on its own does nothing (like Windows) - only the bottom corners do
+    if (Vertical == "bottom" && Horizontal == "")
+        return ""
+
+    return Vertical . Horizontal
+}
+
+;; The area (inside the taskbar) a window in this zone should fill.
+GetZoneRect(Zone, MonitorNumber, &L, &T, &R, &B) {
     MonitorGetWorkArea(MonitorNumber, &L, &T, &R, &B)
-    Rect := L "," T "," R "," B
-    if (Rect == PreviewRect)
+    if (Zone == "top")
         return
-    PreviewRect := Rect
-    PreviewGui.Show(Format("NA x{} y{} w{} h{}", L, T, R - L, B - T))
+    MidX := L + (R - L) // 2
+    MidY := T + (B - T) // 2
+    if (InStr(Zone, "left"))
+        R := MidX
+    if (InStr(Zone, "right"))
+        L := MidX
+    if (InStr(Zone, "top"))
+        B := MidY
+    if (InStr(Zone, "bottom"))
+        T := MidY
+}
+
+;; The part of a window you can actually see. Windows 10/11 windows have an invisible border
+;; around them, so this is a bit smaller than what WinGetPos says.
+GetFrameRect(window, &FX, &FY, &FW, &FH) {
+    WinGetPos(&FX, &FY, &FW, &FH, window)
+    try {
+        Rect := Buffer(16, 0)
+        ;; DWMWA_EXTENDED_FRAME_BOUNDS = 9
+        if (DllCall("dwmapi\DwmGetWindowAttribute", "Ptr", window, "UInt", 9, "Ptr", Rect, "UInt", 16) == 0) {
+            FX := NumGet(Rect, 0, "Int")
+            FY := NumGet(Rect, 4, "Int")
+            FW := NumGet(Rect, 8, "Int") - FX
+            FH := NumGet(Rect, 12, "Int") - FY
+        }
+    }
+}
+
+;; How thick that invisible border is on each side (X, Y, W, H = the window's WinGetPos rectangle).
+GetFrameInsets(window, X, Y, W, H, &IL, &IT, &IR, &IB) {
+    GetFrameRect(window, &FX, &FY, &FW, &FH)
+    IL := FX - X
+    IT := FY - Y
+    IR := (X + W) - (FX + FW)
+    IB := (Y + H) - (FY + FH)
+}
+
+;; Shows the preview. It starts out where the dragged window is and grows into the snap area,
+;; and slides from one area to the next if you move between zones.
+ShowSnapPreview(Zone, MonitorNumber, window) {
+    global PreviewKey, PreviewCur, PreviewDst, PreviewGui, PreviewFillGui, PreviewShown
+
+    Key := Zone "|" MonitorNumber
+    if (Key == PreviewKey)
+        return
+
+    GetZoneRect(Zone, MonitorNumber, &L, &T, &R, &B)
+    PreviewDst := [L, T, R - L, B - T]
+
+    if (PreviewKey == "") {
+        GetFrameRect(window, &FX, &FY, &FW, &FH)
+        PreviewCur := [FX, FY, FW, FH]
+
+        ;; get the shape and position right while it's still hidden, so nothing old flashes up
+        ApplyPreviewRect()
+        PreviewGui.Show(Format("NA x{} y{} w{} h{}", PreviewShown[1], PreviewShown[2], PreviewShown[3], PreviewShown[4]))
+        PreviewFillGui.Show(Format("NA x{} y{} w{} h{}", PreviewShown[1] + PreviewBorder, PreviewShown[2] + PreviewBorder, PreviewShown[3] - 2 * PreviewBorder, PreviewShown[4] - 2 * PreviewBorder))
+    }
+
+    PreviewKey := Key
+}
+
+;; one animation step, called once per frame by the drag loop
+PreviewAnimate() {
+    global PreviewCur, PreviewDst
+
+    Changed := false
+    Loop 4 {
+        Diff := PreviewDst[A_Index] - PreviewCur[A_Index]
+        if (Diff == 0)
+            continue
+        Changed := true
+        if (Abs(Diff) < 1.5)
+            PreviewCur[A_Index] := PreviewDst[A_Index]
+        else
+            PreviewCur[A_Index] += Diff * 0.3
+    }
+    if (Changed)
+        ApplyPreviewRect()
+}
+
+ApplyPreviewRect() {
+    global PreviewGui, PreviewFillGui, PreviewCur, PreviewRadius, PreviewBorder
+    global PreviewShown, PreviewShownSize
+
+    X := Round(PreviewCur[1])
+    Y := Round(PreviewCur[2])
+    W := Max(Round(PreviewCur[3]), 16)
+    H := Max(Round(PreviewCur[4]), 16)
+
+    ;; nothing moved by a whole pixel since last time? then leave the windows alone
+    if (IsObject(PreviewShown) && PreviewShown[1] == X && PreviewShown[2] == Y && PreviewShown[3] == W && PreviewShown[4] == H)
+        return
+    PreviewShown := [X, Y, W, H]
+
+    FillW := W - 2 * PreviewBorder
+    FillH := H - 2 * PreviewBorder
+
+    PreviewGui.Move(X, Y, W, H)
+    PreviewFillGui.Move(X + PreviewBorder, Y + PreviewBorder, FillW, FillH)
+
+    ;; the rounded corners only need rebuilding when the size changes, not when it just moves
+    SizeKey := W "x" H
+    if (SizeKey == PreviewShownSize)
+        return
+    PreviewShownSize := SizeKey
+
+    Radius := PreviewRadius
+    FillRadius := Max(Radius - PreviewBorder, 0)
+
+    ;; the border window is only the ring between the outer and the inner rounded rectangle...
+    Outer := DllCall("CreateRoundRectRgn", "Int", 0, "Int", 0, "Int", W + 1, "Int", H + 1, "Int", Radius * 2, "Int", Radius * 2, "Ptr")
+    Inner := DllCall("CreateRoundRectRgn", "Int", PreviewBorder, "Int", PreviewBorder, "Int", W - PreviewBorder + 1, "Int", H - PreviewBorder + 1, "Int", FillRadius * 2, "Int", FillRadius * 2, "Ptr")
+    DllCall("CombineRgn", "Ptr", Outer, "Ptr", Outer, "Ptr", Inner, "Int", 4) ; RGN_DIFF
+    DllCall("DeleteObject", "Ptr", Inner)
+    DllCall("SetWindowRgn", "Ptr", PreviewGui.Hwnd, "Ptr", Outer, "Int", true)
+
+    ;; ...and the fill window is the inner one
+    FillRegion := DllCall("CreateRoundRectRgn", "Int", 0, "Int", 0, "Int", FillW + 1, "Int", FillH + 1, "Int", FillRadius * 2, "Int", FillRadius * 2, "Ptr")
+    DllCall("SetWindowRgn", "Ptr", PreviewFillGui.Hwnd, "Ptr", FillRegion, "Int", true)
 }
 
 HideSnapPreview() {
-    global PreviewGui, PreviewRect
-    if (PreviewRect == "")
+    global PreviewGui, PreviewFillGui, PreviewKey, PreviewShown, PreviewShownSize
+    if (PreviewKey == "")
         return
-    PreviewRect := ""
+    PreviewKey := ""
+    PreviewShown := ""
+    PreviewShownSize := ""
     PreviewGui.Hide()
+    PreviewFillGui.Hide()
+}
+
+;; Snaps a window to a zone: the top maximizes it, everything else fills half or a quarter of the screen.
+SnapWindowTo(window, Zone, MonitorNumber) {
+    global SnappedWindows
+    WS_MAXIMIZE := 0x1000000
+
+    if (Zone == "top") {
+        SnapMaximize(window, MonitorNumber)
+        return
+    }
+
+    try {
+        if (not WinExist(window))
+            return
+        if (WinGetStyle(window) & WS_MAXIMIZE)
+            return
+
+        WinGetPos(&X, &Y, &W, &H, window)
+        GetZoneRect(Zone, MonitorNumber, &L, &T, &R, &B)
+        GetFrameInsets(window, X, Y, W, H, &IL, &IT, &IR, &IB)
+
+        ;; make the visible part of the window fill the area exactly (the invisible border hangs outside it)
+        MoveAndResize(L - IL, T - IT, (R - L) + IL + IR, (B - T) + IT + IB, window)
+
+        ;; remember the old size so dragging the window away puts it back
+        WinGetPos(&AX, &AY, &AW, &AH, window)
+        SnappedWindows[window] := [W, H, AX, AY, AW, AH]
+    }
+    catch {
+        ;; window vanished, or we're not allowed to touch it
+    }
 }
 
 SnapMaximize(window, MonitorNumber) {
