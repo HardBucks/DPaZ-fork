@@ -3,8 +3,11 @@
 # HardBucks' Fork DPaZ
 
 I really like how linux lets you drag windows around with a hotkey. I tried AltDrag but it has alot of bugs, and I didn't like PowerToys' Move and Grab because of the white foreground overlay.
+
 So I took sebmaynard's [DPaZ](https://github.com/sebmaynard/DPaZ) ahk script and i modify with it using Claude (vibecoding maxxing) and try to make a better version for myself.
+
 Also this script is very basic and it uses ahk. there is probably better alternatives out there, I'm just doing this for personal use
+
 forgive me if I'm making a repository wrong because I've never used GitHub lol.
 
 (rest of this text are ai now)
