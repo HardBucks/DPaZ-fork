@@ -4,16 +4,14 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Move and resize windows by holding the Windows key and
 ;; dragging with the mouse.
-;; Based on DPaZ by sebmaynard
-;; Modified by Claude
 ;;
 ;;    Win + Left mouse:  Move the window under the cursor
 ;;    Win + Right mouse: Resize the window under the cursor
 ;;    Win + Middle mouse: Close the window under the cursor (a normal close, like the X button)
 ;;
-;; - Drag a window until its edge hits a side or corner of the monitor, then let go to snap it:
-;;   top = maximize, left / right = half the screen, corners = a quarter of the screen
-;;   (a see-through preview shows where it will go)
+;; - Snapping: push the mouse against the left or right side of a monitor for half the screen, or
+;;   into a corner for a quarter. Push the top of a window against the top of a monitor to maximize it.
+;;   Hold it there for a moment and a see-through preview shows where it will go - let go to snap.
 ;; - Grabbing a maximized window restores it first
 ;; - The mouse cursor changes while you drag (move arrows, or a diagonal
 ;;   resize arrow that matches the corner you grabbed)
@@ -28,6 +26,9 @@ SetWinDelay -1
 CoordMode "Mouse", "Screen"
 A_MaxHotkeysPerInterval := 1000
 
+;; make sure coordinates are real pixels on every monitor, even when the monitors use different display scaling
+try DllCall("SetThreadDpiAwarenessContext", "Ptr", -4, "Ptr")
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; SETTINGS
 
@@ -39,8 +40,20 @@ global MinHeight := 120
 ;; how many pixels of a window must stay on screen when you drag it towards an edge
 global KeepVisible := 100
 
-;; how close (pixels) the edge of a window has to get to the edge of the monitor to snap
+;; Snapping to the sides and corners follows the MOUSE. Snapping to the top (maximize) follows the WINDOW.
+
+;; how close (pixels) the mouse has to get to the side of a monitor to snap to it
+global SideMargin := 3
+;; ...and next to another monitor. The mouse just carries on over to the other screen there,
+;; so it needs a wider spot to stop in.
+global SharedSideMargin := 12
+;; how close (pixels) to a corner the mouse has to be, along the edge, for a quarter-screen snap
+global CornerSize := 100
+;; how close (pixels) the top of a window has to get to the top of the monitor to maximize
 global SnapMargin := 3
+;; how long (ms) you have to stay in a snap spot before the preview shows up and letting go snaps
+;; (so dragging a window past an edge doesn't snap it - set to 0 to snap straight away)
+global SnapDelay := 150
 
 ;; the see-through preview shown while a window is about to snap
 global PreviewColor := "BCCCE4"
@@ -99,6 +112,9 @@ global SnapZoneInit := false
 global SnapArmed := false
 ;; how many frames in a row the window has been outside every zone (see the snap check)
 global SnapGrace := 0
+;; the snap spot the window is waiting in, and since when (for SnapDelay)
+global SnapCandidate := ""
+global SnapSince := 0
 
 ;; windows we snapped to a half/quarter: window -> [old width, old height, snapped x, y, width, height]
 ;; so that dragging one away gives it its old size back
@@ -235,6 +251,7 @@ ResetGrab() {
     global SnapStartZone := ""
     global SnapZone := ""
     global SnapGrace := 0
+    global SnapCandidate := ""
 }
 
 ;; The drag runs as one loop with one update per screen refresh, instead of a timer.
@@ -312,6 +329,7 @@ DoStuffToWindows(what) {
     global GrabMinW, GrabMaxW, GrabMinH, GrabMaxH
     global FocusOnDrag, DragFocused, SnapArmed, SnapMargin
     global SnapZone, SnapStartZone, SnapZoneInit, SnappedWindows, SnapGrace
+    global SnapCandidate, SnapSince, SnapDelay
     global MinWidth, MinHeight, KeepVisible, DragThreshold
 
     ;; a stray timer from a drag that's already over
@@ -434,17 +452,12 @@ DoStuffToWindows(what) {
                         NextStartX := StartX + (NewX - X)
                         NextStartY := StartY + (NewY - Y)
 
-                        ;; has the window been pushed against a side or corner of the monitor the cursor is on?
-                        ;; then letting go will snap it there
-                        Mon := GetMonitorAt(MouseX, MouseY)
-                        Zone := ""
-                        if (Mon) {
-                            MonitorGet(Mon, &ML, &MT, &MR, &MB)
-                            GetFrameInsets(Window, X, Y, W, H, &IL, &IT, &IR, &IB)
-                            Zone := GetSnapZone(NewX + IL, NewY + IT, NewX + W - IR, NewY + H - IB, ML, MT, MR, MB, MouseY, SnapZone)
-                        }
+                        ;; is the mouse against a side or corner of a monitor, or the top of the window against
+                        ;; the top of one? then letting go will snap it there
+                        GetFrameInsets(Window, X, Y, W, H, &IL, &IT, &IR, &IB)
+                        Zone := GetSnapZone(MouseX, MouseY, NewX + IL, NewY + IT, NewX + W - IR, NewY + H - IB, SnapZone, &Mon)
 
-                        ;; a window that starts out against an edge has to leave it before it can snap
+                        ;; a window that starts out in a snap spot has to leave it before it can snap
                         if (not SnapZoneInit) {
                             SnapZoneInit := true
                             SnapStartZone := Zone
@@ -456,19 +469,29 @@ DoStuffToWindows(what) {
                         CanSnap := (Zone == "top") ? (Style & WS_MAXIMIZEBOX) : (Style & WS_THICKFRAME)
 
                         if (Zone != "" && SnapArmed && DragMoved && CanSnap) {
-                            SnapGrace := 0
-                            SnapWindow := Window
-                            SnapMonitor := Mon
-                            SnapZone := Zone
-                            ShowSnapPreview(Zone, Mon, Window)
+                            ;; how long has it been waiting in this spot?
+                            Candidate := Zone "|" Mon
+                            if (Candidate != SnapCandidate) {
+                                SnapCandidate := Candidate
+                                SnapSince := A_TickCount
+                            }
+
+                            if (A_TickCount - SnapSince >= SnapDelay) {
+                                SnapGrace := 0
+                                SnapWindow := Window
+                                SnapMonitor := Mon
+                                SnapZone := Zone
+                                ShowSnapPreview(Zone, Mon, Window)
+                            }
                         }
                         else if (SnapWindow && SnapGrace < 4) {
-                            ;; outside every zone for a frame or two - most likely a wobble right at the
+                            ;; outside every spot for a frame or two - most likely a wobble right at the
                             ;; edge, so keep the preview up instead of hiding it and showing it again
                             SnapGrace += 1
                         }
                         else {
                             SnapGrace := 0
+                            SnapCandidate := ""
                             SnapWindow := ""
                             SnapMonitor := 0
                             SnapZone := ""
@@ -584,44 +607,74 @@ PointOnAnyMonitor(PX, PY) {
     return false
 }
 
-;; Works out which snap zone a window is in, given where its visible edges are and the monitor's edges.
-;; Returns "top", "left", "right", "topleft", "topright", "bottomleft", "bottomright" or "".
-GetSnapZone(VisLeft, VisTop, VisRight, VisBottom, ML, MT, MR, MB, CursorY, PrevZone := "") {
-    global SnapMargin
+;; Works out which snap zone the drag is in. Returns "top", "left", "right", "topleft", "topright",
+;; "bottomleft", "bottomright" or "", and sets ZoneMon to the monitor it is on.
+;;
+;; Sides and corners go by the MOUSE (it gets pushed against the edge of its monitor).
+;; The top (maximize) goes by the WINDOW: the top of the window reaching the top of the monitor it is on.
+;; That way the top still works on a monitor that has another one above it, where the mouse
+;; would just carry on up onto the other screen.
+GetSnapZone(MouseX, MouseY, VisLeft, VisTop, VisRight, VisBottom, PrevZone, &ZoneMon) {
+    global SideMargin, SharedSideMargin, CornerSize, SnapMargin
 
-    ;; once a window is in a zone it takes a bit more to leave it again. Without that, a window sitting
-    ;; right on the margin flips in and out every frame, and the preview flickers.
-    Extra := 8
-    AtLeft := (VisLeft <= ML + SnapMargin + (InStr(PrevZone, "left") ? Extra : 0))
-    AtRight := (VisRight >= MR - SnapMargin - (InStr(PrevZone, "right") ? Extra : 0))
-    AtTop := (VisTop <= MT + SnapMargin + (InStr(PrevZone, "top") ? Extra : 0))
-    AtBottom := (VisBottom >= MB - SnapMargin - (InStr(PrevZone, "bottom") ? Extra : 0))
-
-    ;; a window as wide (or tall) as the monitor touches both sides, which tells us nothing
-    if (AtLeft && AtRight) {
-        AtLeft := false
-        AtRight := false
-    }
-    if (AtTop && AtBottom)
-        AtBottom := false
-
-    Vertical := AtTop ? "top" : (AtBottom ? "bottom" : "")
-    Horizontal := AtLeft ? "left" : (AtRight ? "right" : "")
-
-    ;; a plain left/right edge doesn't count if there's another monitor on the other side of it - then
-    ;; you're just dragging the window across onto that monitor. The corners still count though.
-    if (Vertical == "") {
-        if (Horizontal == "left" && PointOnAnyMonitor(ML - 1, CursorY))
-            Horizontal := ""
-        if (Horizontal == "right" && PointOnAnyMonitor(MR, CursorY))
-            Horizontal := ""
-    }
-
-    ;; the bottom edge on its own does nothing (like Windows) - only the bottom corners do
-    if (Vertical == "bottom" && Horizontal == "")
+    ZoneMon := 0
+    Mon := GetMonitorAt(MouseX, MouseY)
+    if (not Mon)
         return ""
+    MonitorGet(Mon, &ML, &MT, &MR, &MB)
 
-    return Vertical . Horizontal
+    ;; once you're in a spot it takes a bit more to leave it again. Without that, sitting right on the
+    ;; margin flips in and out every frame and the preview flickers.
+    Extra := 8
+
+    ;; how close the mouse has to be to each side - wider where another monitor is on the other side of it
+    MarginL := (PointOnAnyMonitor(ML - 1, MouseY) ? SharedSideMargin : SideMargin) + (InStr(PrevZone, "left") ? Extra : 0)
+    MarginR := (PointOnAnyMonitor(MR, MouseY) ? SharedSideMargin : SideMargin) + (InStr(PrevZone, "right") ? Extra : 0)
+    MarginT := (PointOnAnyMonitor(MouseX, MT - 1) ? SharedSideMargin : SideMargin) + (InStr(PrevZone, "top") ? Extra : 0)
+    MarginB := (PointOnAnyMonitor(MouseX, MB) ? SharedSideMargin : SideMargin) + (InStr(PrevZone, "bottom") ? Extra : 0)
+
+    NearLeft := (MouseX <= ML + MarginL)
+    NearRight := (MouseX >= MR - MarginR)
+    NearTop := (MouseY <= MT + MarginT)
+    NearBottom := (MouseY >= MB - MarginB)
+
+    ;; the mouse is against the left or right side: a half, or a quarter if it's up in a corner
+    if (NearLeft != NearRight) {
+        Horizontal := NearLeft ? "left" : "right"
+        Vertical := ""
+        if (MouseY <= MT + CornerSize)
+            Vertical := "top"
+        else if (MouseY >= MB - CornerSize)
+            Vertical := "bottom"
+        ZoneMon := Mon
+        return Vertical . Horizontal
+    }
+
+    ;; the mouse is against the top or bottom and has slid along it into a corner: a quarter
+    if (NearTop != NearBottom) {
+        Vertical := NearTop ? "top" : "bottom"
+        Horizontal := ""
+        if (MouseX <= ML + CornerSize)
+            Horizontal := "left"
+        else if (MouseX >= MR - CornerSize)
+            Horizontal := "right"
+        if (Horizontal != "") {
+            ZoneMon := Mon
+            return Vertical . Horizontal
+        }
+    }
+
+    ;; the top of the window against the top of the monitor the window is mostly on: maximize
+    WinMon := GetMonitorAt((VisLeft + VisRight) // 2, (VisTop + VisBottom) // 2)
+    if (not WinMon)
+        WinMon := Mon
+    MonitorGet(WinMon, &WL, &WT, &WR, &WB)
+    if (VisTop <= WT + SnapMargin + (InStr(PrevZone, "top") ? Extra : 0)) {
+        ZoneMon := WinMon
+        return "top"
+    }
+
+    return ""
 }
 
 ;; The area (inside the taskbar) a window in this zone should fill.
