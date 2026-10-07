@@ -4,6 +4,8 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Move and resize windows by holding the Windows key and
 ;; dragging with the mouse.
+;; Based on DPaZ by sebmaynard
+;; Modified by Claude
 ;;
 ;;    Win + Left mouse:  Move the window under the cursor
 ;;    Win + Right mouse: Resize the window under the cursor
@@ -43,7 +45,7 @@ global KeepVisible := 100
 ;; Snapping to the sides and corners follows the MOUSE. Snapping to the top (maximize) follows the WINDOW.
 
 ;; how close (pixels) the mouse has to get to the side of a monitor to snap to it
-global SideMargin := 3
+global SideMargin := 180
 ;; ...and next to another monitor. The mouse just carries on over to the other screen there,
 ;; so it needs a wider spot to stop in.
 global SharedSideMargin := 12
@@ -53,11 +55,14 @@ global CornerSize := 100
 global SnapMargin := 3
 ;; how long (ms) you have to stay in a snap spot before the preview shows up and letting go snaps
 ;; (so dragging a window past an edge doesn't snap it - set to 0 to snap straight away)
-global SnapDelay := 150
+global SnapDelay := 20
 
 ;; the see-through preview shown while a window is about to snap
-global PreviewColor := "BCCCE4"
+global PreviewColor := "2c3036"   ; 6 digit hex colour (RRGGBB)
 global PreviewOpacity := 120   ; 0 (invisible) to 255 (solid)
+;; true  = blurred "acrylic" glass look (needs Windows 10 version 1803 or newer)
+;; false = plain see-through colour (also used automatically if acrylic doesn't work)
+global PreviewAcrylic := true
 global PreviewRadius := 8      ; how round the corners are, 0 = square
 
 ;; how far (pixels) you have to drag before a click turns into a drag
@@ -120,16 +125,23 @@ global SnapSince := 0
 ;; so that dragging one away gives it its old size back
 global SnappedWindows := Map()
 
-;; The snap preview: two plain click-through windows that never take focus - a thin light ring
-;; (the border) and the see-through fill inside it. Plain solid-colour windows don't flicker when they
+;; The snap preview: two plain windows that never take focus - a thin light ring (the border) and
+;; the see-through fill inside it. Plain windows with nothing inside them don't flicker when they
 ;; are moved or resized, which a window with a control inside it does.
 global PreviewBorder := 2
 global PreviewGui := Gui("+AlwaysOnTop -Caption +ToolWindow -DPIScale +E0x80000 +E0x20 +E0x80 +E0x8000000", "DPaZ snap preview")
 PreviewGui.BackColor := "FFFFFF"
 DllCall("SetLayeredWindowAttributes", "Ptr", PreviewGui.Hwnd, "UInt", 0, "UChar", PreviewOpacity, "UInt", 2)
-global PreviewFillGui := Gui("+AlwaysOnTop -Caption +ToolWindow -DPIScale +E0x80000 +E0x20 +E0x80 +E0x8000000", "DPaZ snap preview fill")
-PreviewFillGui.BackColor := PreviewColor
-DllCall("SetLayeredWindowAttributes", "Ptr", PreviewFillGui.Hwnd, "UInt", 0, "UChar", PreviewOpacity, "UInt", 2)
+;; The fill is acrylic if Windows allows it. Acrylic can't be combined with a layered window, so this one
+;; isn't. Its own background is painted black, which Windows treats as "nothing here" so the glass shows.
+global PreviewFillGui := Gui("+AlwaysOnTop -Caption +ToolWindow -DPIScale +E0x20 +E0x80 +E0x8000000", "DPaZ snap preview fill")
+PreviewFillGui.BackColor := "000000"
+if (not (PreviewAcrylic && EnableAcrylic(PreviewFillGui.Hwnd, PreviewColor, PreviewOpacity))) {
+    ;; no acrylic: go back to a plain see-through coloured window
+    PreviewFillGui.Opt("+E0x80000")
+    PreviewFillGui.BackColor := PreviewColor
+    DllCall("SetLayeredWindowAttributes", "Ptr", PreviewFillGui.Hwnd, "UInt", 0, "UChar", PreviewOpacity, "UInt", 2)
+}
 ;; "" when hidden, otherwise which zone/monitor it is showing
 global PreviewKey := ""
 ;; where the preview is now, and where it is growing towards: [x, y, width, height]
@@ -717,6 +729,31 @@ GetFrameInsets(window, X, Y, W, H, &IL, &IT, &IR, &IB) {
     IT := FY - Y
     IR := (X + W) - (FX + FW)
     IB := (Y + H) - (FY + FH)
+}
+
+;; Turns on the blurred "acrylic" glass effect for a window, tinted with the given colour.
+;; This uses an undocumented Windows call (the same one other tools use), so it returns false if it
+;; isn't available and the caller falls back to a plain see-through window.
+EnableAcrylic(hwnd, ColorHex, Alpha) {
+    try {
+        R := Integer("0x" SubStr(ColorHex, 1, 2))
+        G := Integer("0x" SubStr(ColorHex, 3, 2))
+        B := Integer("0x" SubStr(ColorHex, 5, 2))
+
+        ;; ACCENT_POLICY: state 4 = acrylic blur-behind, colour is ABGR
+        Accent := Buffer(16, 0)
+        NumPut("Int", 4, Accent, 0)
+        NumPut("UInt", (Alpha << 24) | (B << 16) | (G << 8) | R, Accent, 8)
+
+        ;; WINDOWCOMPOSITIONATTRIBDATA: attribute 19 = the accent policy
+        Data := Buffer(3 * A_PtrSize, 0)
+        NumPut("Int", 19, Data, 0)
+        NumPut("Ptr", Accent.Ptr, Data, A_PtrSize)
+        NumPut("UPtr", Accent.Size, Data, 2 * A_PtrSize)
+
+        return DllCall("user32\SetWindowCompositionAttribute", "Ptr", hwnd, "Ptr", Data) != 0
+    }
+    return false
 }
 
 ;; Shows the preview. It starts out where the dragged window is and grows into the snap area,
