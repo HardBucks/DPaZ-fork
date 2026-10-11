@@ -50,7 +50,7 @@ global KeepVisible := 100
 ;; Snapping to the sides and corners follows the MOUSE. Snapping to the top (maximize) follows the WINDOW.
 
 ;; how close (pixels) the mouse has to get to the side of a monitor to snap to it
-global SideMargin := 3
+global SideMargin := 180
 ;; ...and next to another monitor. The mouse just carries on over to the other screen there,
 ;; so it needs a wider spot to stop in.
 global SharedSideMargin := 12
@@ -60,10 +60,10 @@ global CornerSize := 100
 global SnapMargin := 3
 ;; how long (ms) you have to stay in a snap spot before the preview shows up and letting go snaps
 ;; (so dragging a window past an edge doesn't snap it - set to 0 to snap straight away)
-global SnapDelay := 150
+global SnapDelay := 20
 
 ;; the see-through preview shown while a window is about to snap
-global PreviewColor := "BCCCE4"   ; 6 digit hex colour (RRGGBB)
+global PreviewColor := "2c3036"   ; 6 digit hex colour (RRGGBB)
 global PreviewOpacity := 120   ; 0 (invisible) to 255 (solid)
 ;; true  = blurred "acrylic" glass look (needs Windows 10 version 1803 or newer)
 ;; false = plain see-through colour (also used automatically if acrylic doesn't work)
