@@ -28,6 +28,11 @@ SetWinDelay -1
 CoordMode "Mouse", "Screen"
 A_MaxHotkeysPerInterval := 1000
 
+;; When you let go of the Win key after using a Win+mouse hotkey, AutoHotkey taps another key so Windows
+;; doesn't open the Start menu. Make sure that is an unused key and not Ctrl, so it can't turn into a
+;; Ctrl+Win shortcut.
+try A_MenuMaskKey := "vkE8"
+
 ;; make sure coordinates are real pixels on every monitor, even when the monitors use different display scaling
 try DllCall("SetThreadDpiAwarenessContext", "Ptr", -4, "Ptr")
 
@@ -45,7 +50,7 @@ global KeepVisible := 100
 ;; Snapping to the sides and corners follows the MOUSE. Snapping to the top (maximize) follows the WINDOW.
 
 ;; how close (pixels) the mouse has to get to the side of a monitor to snap to it
-global SideMargin := 180
+global SideMargin := 3
 ;; ...and next to another monitor. The mouse just carries on over to the other screen there,
 ;; so it needs a wider spot to stop in.
 global SharedSideMargin := 12
@@ -55,10 +60,10 @@ global CornerSize := 100
 global SnapMargin := 3
 ;; how long (ms) you have to stay in a snap spot before the preview shows up and letting go snaps
 ;; (so dragging a window past an edge doesn't snap it - set to 0 to snap straight away)
-global SnapDelay := 20
+global SnapDelay := 150
 
 ;; the see-through preview shown while a window is about to snap
-global PreviewColor := "2c3036"   ; 6 digit hex colour (RRGGBB)
+global PreviewColor := "BCCCE4"   ; 6 digit hex colour (RRGGBB)
 global PreviewOpacity := 120   ; 0 (invisible) to 255 (solid)
 ;; true  = blurred "acrylic" glass look (needs Windows 10 version 1803 or newer)
 ;; false = plain see-through colour (also used automatically if acrylic doesn't work)
@@ -68,6 +73,11 @@ global PreviewRadius := 8      ; how round the corners are, 0 = square
 ;; how far (pixels) you have to drag before a click turns into a drag
 ;; (so a plain Win+click on a maximized window doesn't un-maximize it)
 global DragThreshold := 6
+
+;; true  = change the mouse cursor while dragging (move arrows / diagonal resize arrows)
+;; false = leave the cursor alone. This swaps Windows' own cursors for the length of the drag,
+;; so if something system-wide acts up, turning this off is the first thing to try.
+global ChangeCursor := true
 
 ;; true  = bring the window to the front and give it focus when you start dragging it
 ;; false = leave focus and the window order alone while dragging
@@ -104,6 +114,9 @@ global GrabMinW := 0
 global GrabMaxW := 0
 global GrabMinH := 0
 global GrabMaxH := 0
+;; the "is this a normal window" check is done once per drag, not every frame
+global GrabbedChecked := false
+global GrabbedAllowed := false
 
 ;; the window (and monitor number) that will be maximized if the mouse is released now
 global SnapWindow := ""
@@ -257,6 +270,8 @@ ResetGrab() {
     global GrabMaxW := 0
     global GrabMinH := 0
     global GrabMaxH := 0
+    global GrabbedChecked := false
+    global GrabbedAllowed := false
     global DragFocused := false
     global SnapArmed := false
     global SnapZoneInit := false
@@ -342,6 +357,7 @@ DoStuffToWindows(what) {
     global FocusOnDrag, DragFocused, SnapArmed, SnapMargin
     global SnapZone, SnapStartZone, SnapZoneInit, SnappedWindows, SnapGrace
     global SnapCandidate, SnapSince, SnapDelay
+    global GrabbedChecked, GrabbedAllowed
     global MinWidth, MinHeight, KeepVisible, DragThreshold
 
     ;; a stray timer from a drag that's already over
@@ -383,7 +399,15 @@ DoStuffToWindows(what) {
         if (Window && WinExist(Window)) {
             WinGetPos(&X, &Y, &W, &H, Window)
 
-            if (IsGoodWindow(Window, X, Y, W, H)) {
+            ;; asking a window for its class, title and so on means talking to its program, so do the
+            ;; "is this a normal window" checks once at the start instead of a hundred times a second
+            if (not GrabbedChecked) {
+                GrabbedChecked := true
+                GrabbedAllowed := IsGoodWindow(Window, X, Y, W, H)
+            }
+
+            ;; a window that stops responding in the middle of a drag is let go of straight away
+            if (GrabbedAllowed && not DllCall("IsHungAppWindow", "Ptr", Window)) {
                 Style := WinGetStyle(Window)
 
                 ;; move cursor - for a maximized window only once it's really being dragged
@@ -914,8 +938,8 @@ SnapMaximize(window, MonitorNumber) {
 ;; Swaps every system cursor (arrow, text beam, hand, etc.) for the one we want, so it shows
 ;; no matter what is under the mouse. RestoreCursor puts the user's real cursors back.
 SetDragCursor(kind) {
-    global CursorState
-    if (kind == CursorState)
+    global CursorState, ChangeCursor
+    if (not ChangeCursor || kind == CursorState)
         return
 
     ;; IDC_SIZEALL, IDC_SIZENWSE, IDC_SIZENESW
@@ -938,7 +962,10 @@ SetDragCursor(kind) {
 }
 
 RestoreCursor(force := false) {
-    global CursorState
+    global CursorState, ChangeCursor
+    ;; with ChangeCursor off we never touch the system cursors, not even to "restore" them
+    if (not ChangeCursor)
+        return
     if (CursorState == "" && not force)
         return
     CursorState := ""
@@ -980,6 +1007,20 @@ IsGoodWindow(window, X, Y, W, H) {
                          , "Windows.UI.Core.CoreWindow", "NotifyIconOverflowWindow"
                          , "TopLevelWindowForOverflowXamlIsland"] {
             if (WinClassName = shellClass)
+                return false
+        }
+
+        ;; Skip the parts of Windows itself: Start, search, widgets, quick settings, notification centre,
+        ;; task view and so on. They live inside explorer.exe and other system programs, and shoving them
+        ;; around (or closing them) can upset the shell. Real File Explorer folder windows are fine.
+        ProcessName := WinGetProcessName(window)
+        if (ProcessName = "explorer.exe" && WinClassName != "CabinetWClass")
+            return false
+        for systemProgram in ["ShellExperienceHost.exe", "StartMenuExperienceHost.exe", "SearchHost.exe"
+                            , "SearchApp.exe", "TextInputHost.exe", "LockApp.exe", "LogonUI.exe"
+                            , "ShellHost.exe", "Widgets.exe", "WidgetBoard.exe", "dwm.exe"
+                            , "csrss.exe", "winlogon.exe", "fontdrvhost.exe"] {
+            if (ProcessName = systemProgram)
                 return false
         }
 
